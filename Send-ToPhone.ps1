@@ -1,6 +1,7 @@
 [CmdletBinding(DefaultParameterSetName = 'Send')]
 param(
     [Parameter(Mandatory, ParameterSetName = 'Pair')][switch]$Pair,
+    [Parameter(Mandatory, ParameterSetName = 'Message')][string]$Message,
     [Parameter(Mandatory, Position = 0, ParameterSetName = 'Send')][string]$Path,
     [Parameter(ParameterSetName = 'Send')][string]$Caption,
     [Parameter(ParameterSetName = 'Send')][switch]$AsFile
@@ -32,7 +33,7 @@ function Invoke-Telegram($Token, $Method, $Body, [int]$TimeoutSeconds = 25) {
             $response = $client.PostAsync("https://api.telegram.org/bot$Token/$Method", $Body, $timeout.Token).GetAwaiter().GetResult()
             $json = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
         } catch {
-            if($timeout.IsCancellationRequested) { throw "Telegram timed out during $Method. Check your chat before retrying an upload." }
+            if($timeout.IsCancellationRequested) { throw "Telegram timed out during $Method. Check your chat before retrying." }
             throw "Could not reach Telegram during $Method. Check this computer's internet connection."
         }
         try { $payload = ConvertFrom-Json -InputObject $json } catch { throw "Telegram returned an unreadable response during $Method (HTTP $([int]$response.StatusCode))." }
@@ -94,9 +95,7 @@ function Connect-Telegram {
     } finally { if($null -ne $secret) { $secret.Dispose() } }
 }
 
-function Send-TelegramFile {
-    $file = Get-Item -LiteralPath $Path
-    if($file -isnot [IO.FileInfo]) { throw 'Choose a file to send.' }
+function Get-TelegramDestination {
     if(!(Test-Path -LiteralPath $configPath -PathType Leaf)) { throw 'MyDropBot is not paired. Run Pair-MyDropBot.cmd first.' }
     $token = Get-TelegramEnvToken
     $savedToken = $null
@@ -115,29 +114,67 @@ function Send-TelegramFile {
     if(!$token) { $token = $savedToken }
     if($token -cnotmatch $tokenPattern) { throw 'Set TELEGRAM_BOT_TOKEN in %LOCALAPPDATA%\MyDropBot\.env or run Pair-MyDropBot.cmd to store the token securely.' }
     if($token.Split(':')[0] -cne $botId) { throw 'This token belongs to a different bot. Use a token for your paired bot or run Pair-MyDropBot.cmd again.' }
+    return @{ token = $token; chatId = $chatId }
+}
 
-    $field = 'document'
-    $method = 'sendDocument'
-    $mediaType = 'application/octet-stream'
-    if(!$AsFile -and $file.Extension -ieq '.mp4') {
-        $field = 'video'
-        $method = 'sendVideo'
-        $mediaType = 'video/mp4'
+function Send-TelegramMessage {
+    if([string]::IsNullOrWhiteSpace($Message)) { throw 'Enter a message to send.' }
+    $destination = Get-TelegramDestination
+    $json = ConvertTo-Json -InputObject @{ chat_id = $destination.chatId; text = $Message } -Compress
+    $body = [Net.Http.StringContent]::new($json, [Text.Encoding]::UTF8, 'application/json')
+    $sent = Invoke-Telegram $destination.token 'sendMessage' $body
+    Write-Output "Sent a message to your Telegram chat (message $($sent.message_id))."
+}
+
+function Get-TelegramPhotoMediaType($Stream) {
+    if($Stream.Length -gt 10MB) { return }
+    $image = $null
+    try {
+        Add-Type -AssemblyName System.Drawing
+        $image = [Drawing.Image]::FromStream($Stream, $false, $false)
+        if($image.Width + $image.Height -gt 10000 -or [Math]::Max($image.Width, $image.Height) -gt 20 * [Math]::Min($image.Width, $image.Height)) { return }
+        if($image.RawFormat.Guid -eq [Drawing.Imaging.ImageFormat]::Png.Guid) { return 'image/png' }
+        if($image.RawFormat.Guid -eq [Drawing.Imaging.ImageFormat]::Jpeg.Guid) { return 'image/jpeg' }
+    } catch { return }
+    finally {
+        if($null -ne $image) { $image.Dispose() }
+        $Stream.Position = 0
     }
+}
+
+function Send-TelegramFile {
+    $file = Get-Item -LiteralPath $Path
+    if($file -isnot [IO.FileInfo]) { throw 'Choose a file to send.' }
+    $destination = Get-TelegramDestination
     $stream = $file.OpenRead()
     try {
         if($stream.Length -eq 0) { throw 'The file is empty.' }
         if($stream.Length -gt 50MB) { throw 'Telegram bot uploads are limited to 50 MB. Choose a smaller file or render a smaller video preview.' }
+        $field = 'document'
+        $method = 'sendDocument'
+        $mediaType = 'application/octet-stream'
+        if(!$AsFile -and $file.Extension -ieq '.mp4') {
+            $field = 'video'
+            $method = 'sendVideo'
+            $mediaType = 'video/mp4'
+        } elseif(!$AsFile -and $file.Extension -in '.jpg', '.jpeg', '.png') {
+            $photoMediaType = Get-TelegramPhotoMediaType $stream
+            if($photoMediaType) {
+                $field = 'photo'
+                $method = 'sendPhoto'
+                $mediaType = $photoMediaType
+            }
+        }
         $body = [Net.Http.MultipartFormDataContent]::new()
         try {
-            $body.Add([Net.Http.StringContent]::new([string]$chatId), 'chat_id')
+            $body.Add([Net.Http.StringContent]::new([string]$destination.chatId), 'chat_id')
             if($Caption) { $body.Add([Net.Http.StringContent]::new($Caption), 'caption') }
             if($field -eq 'video') { $body.Add([Net.Http.StringContent]::new('true'), 'supports_streaming') }
             $upload = [Net.Http.StreamContent]::new($stream)
             try {
                 $upload.Headers.ContentType = [Net.Http.Headers.MediaTypeHeaderValue]::new($mediaType)
                 $body.Add($upload, $field, $file.Name)
-                $sent = Invoke-Telegram $token $method $body 600
+                $sent = Invoke-Telegram $destination.token $method $body 600
             } finally { $upload.Dispose() }
         } finally { $body.Dispose() }
     } finally { $stream.Dispose() }
@@ -153,6 +190,7 @@ try {
     $client = [Net.Http.HttpClient]::new($handler)
     $client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
     if($Pair) { Connect-Telegram }
+    elseif($PSCmdlet.ParameterSetName -eq 'Message') { Send-TelegramMessage }
     else { Send-TelegramFile }
 } catch {
     [Console]::Error.WriteLine($_.Exception.Message)
